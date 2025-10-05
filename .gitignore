@@ -52,7 +52,6 @@ coverage.xml
 
 # VS Code
 .vscode/
-conversation
 
 # Next.js
 /.next/
@@ -75,3 +74,6 @@ yarn.lock
 .DS_Store
 *.log
 services/frontend/.next
+
+# Allow lib directory
+!services/frontend/src/lib/

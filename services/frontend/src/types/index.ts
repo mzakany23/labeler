@@ -48,8 +48,10 @@ export interface Rule {
   id: string;
   name: string;
   description?: string;
+  // Legacy pattern field for backward compatibility
+  pattern?: string;
   // Advanced rule conditions
-  conditions: {
+  conditions?: {
     description?: string;
     merchant?: string;
     amount?: {
@@ -64,7 +66,7 @@ export interface Rule {
     };
   };
   // Regex patterns for advanced matching
-  regex: {
+  regex?: {
     description?: string;
     merchant?: string;
   };
@@ -76,7 +78,7 @@ export interface Rule {
   createdAt: Date;
   updatedAt: Date;
   createdFrom?: string; // ID of transaction that created this rule
-  matchCount: number; // Number of transactions this rule has matched
+  matchCount?: number; // Number of transactions this rule has matched
   transactionIds: string[]; // Transactions assigned to this rule
 }
 
@@ -87,13 +89,13 @@ export interface DataState {
   isLoading: boolean;
   labels: Label[];
   labelGroups: LabelGroup[];
-  selectedRows: Set<string>;
+  selectedRowIds: string[]; // Array-based storage to prevent Set re-render issues
   actionHistory: LabelingAction[];
   currentHistoryIndex: number;
   isLabelingMode: boolean;
   recommendations: any[]; // Will be typed as Recommendation[] when imported
   isGeneratingRecommendations: boolean;
-  dismissedRecommendations: Set<string>;
+  dismissedRecommendationIds: string[]; // Array-based storage to prevent Set re-render issues
   rulePreview: any | null; // Will be typed as RulePreview when imported
   isRuleModalOpen: boolean;
   rules: Rule[]; // New rules state

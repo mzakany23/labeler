@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { DataState, Label, LabelGroup, LabelingAction, TransactionData, Rule } from '@/types';
 import {
@@ -10,7 +10,9 @@ import {
   hasStoredData,
   generateSessionId,
   getActiveSessionId
-} from '@/lib/statePersistence';
+} from '@/lib/statePersistenceV2';
+import { getStateSync } from '@/lib/adapters';
+import { autoMigrateIfNeeded } from '@/lib/adapters/migrateSessions';
 
 // Component works! Now restoring the main app
 import { processCsvFile } from '@/lib/csvProcessor';
@@ -24,7 +26,6 @@ import {
 } from '@/lib/labelingUtils';
 import { createRulePreview, applyRule } from '@/lib/ruleEngine';
 import {
-  createRule,
   updateRule,
   addTransactionToRule,
   removeTransactionFromRule,
@@ -51,6 +52,8 @@ import LabelManager from '@/components/LabelManager';
 import LabelingDataPreview from '@/components/LabelingDataPreview';
 import RulePreviewModal from '@/components/RulePreviewModal';
 import RuleManager from '@/components/RuleManager';
+import SyncStatusIndicator from '@/components/SyncStatusIndicator';
+import SyncNotification from '@/components/SyncNotification';
 import { Tag, FileSpreadsheet, TrendingUp, Undo, Redo } from 'lucide-react';
 import SessionList from '@/components/SessionList';
 
@@ -67,13 +70,13 @@ export default function Home() {
     isLoading: false,
     labels: createDefaultLabels(),
     labelGroups: [],
-    selectedRows: new Set<string>(),
+    selectedRowIds: [],
     actionHistory: [],
     currentHistoryIndex: -1,
     isLabelingMode: false,
     recommendations: [],
     isGeneratingRecommendations: false,
-    dismissedRecommendations: new Set<string>(),
+    dismissedRecommendationIds: [],
     rulePreview: null,
     isRuleModalOpen: false,
     rules: [], // New rules state
@@ -82,59 +85,225 @@ export default function Home() {
 
   const [activeTab, setActiveTab] = useState<'labeling' | 'report' | 'labels'>('labeling');
   const [isLoaded, setIsLoaded] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline' | 'error'>('synced');
+  const [syncNotification, setSyncNotification] = useState<{ message: string; type: 'syncing' | 'success' | 'error' } | null>(null);
+  const [showSuccessMessage, setShowSuccessMessage] = useState(false);
+  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isNavigatingRef = useRef(false);
+  const justLoadedRef = useRef(false);
+  const isResettingRef = useRef(false);
+  const stateSyncRef = useRef<any>(null);
+
+  // Initialize StateSync only on client side
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !stateSyncRef.current) {
+      stateSyncRef.current = getStateSync({
+        strategy: 'local-first',
+        conflictResolution: 'latest-wins',
+        autoSync: true,
+        syncInterval: 30000,
+      });
+      
+      // Listen for sync events
+      const handleSyncStart = () => {
+        setSyncNotification({ message: 'Syncing sessions to backend...', type: 'syncing' });
+      };
+      
+      const handleSyncComplete = (e: Event) => {
+        const detail = (e as CustomEvent).detail;
+        setSyncNotification({ 
+          message: `Successfully synced ${detail.count} session(s) to backend`, 
+          type: 'success' 
+        });
+      };
+      
+      const handleSyncError = (e: Event) => {
+        const detail = (e as CustomEvent).detail;
+        setSyncNotification({ 
+          message: `Sync failed: ${detail.error || 'Unknown error'}`, 
+          type: 'error' 
+        });
+      };
+      
+      window.addEventListener('sync-start', handleSyncStart);
+      window.addEventListener('sync-complete', handleSyncComplete);
+      window.addEventListener('sync-error', handleSyncError);
+      
+      // Auto-migrate old sessions to backend if available
+      autoMigrateIfNeeded().catch(err => {
+        console.error('Auto-migration failed:', err);
+      });
+      
+      return () => {
+        window.removeEventListener('sync-start', handleSyncStart);
+        window.removeEventListener('sync-complete', handleSyncComplete);
+        window.removeEventListener('sync-error', handleSyncError);
+      };
+    }
+  }, []);
+
+  // Memoized Set for dismissed recommendations (used for O(1) lookups)
+  const dismissedRecSet = useMemo(
+    () => new Set(dataState.dismissedRecommendationIds),
+    [dataState.dismissedRecommendationIds]
+  );
+
+  // Extract URL session ID for use in effects
+  const urlSessionId = searchParams.get('session');
+
 
   // Load persisted state on client-side only (prevents hydration errors)
   useEffect(() => {
-    const urlSessionId = searchParams.get('session');
+    const loadSession = async () => {
 
-    if (urlSessionId) {
-      // Load state from URL session ID
-      setSessionId(urlSessionId);
-      const persisted = loadStateFromStorage(urlSessionId);
+      if (urlSessionId) {
+        // Skip if we're already on this session and data is loaded
+        if (sessionId === urlSessionId && dataState.data) {
+          if (!isLoaded) setIsLoaded(true);
+          return;
+        }
 
-      if (persisted) {
-        setDataState(persisted.dataState);
-        setActiveTab(persisted.activeTab);
+        // Load state from URL session ID using StateSync
+        setSessionId(urlSessionId);
+        setSyncStatus('syncing');
+        
+        try {
+          if (!stateSyncRef.current) {
+            console.warn('StateSync not initialized yet, using localStorage fallback');
+            const persisted = loadStateFromStorage(urlSessionId);
+            if (persisted) {
+              const migratedState = {
+                ...persisted.dataState,
+                selectedRowIds: persisted.dataState.selectedRowIds || [],
+                dismissedRecommendationIds: persisted.dataState.dismissedRecommendationIds || [],
+              };
+              setDataState(migratedState);
+              setActiveTab(persisted.activeTab as 'labeling' | 'report' | 'labels');
+              setSyncStatus('synced');
+              // Set isLoaded after state is set
+              setTimeout(() => setIsLoaded(true), 100);
+            } else {
+              setIsLoaded(true);
+            }
+            return;
+          }
+
+          const persisted = await stateSyncRef.current.loadState(urlSessionId);
+
+          if (persisted) {
+            justLoadedRef.current = true; // Prevent immediate save after load
+            
+            // Migrate old state format (Sets to arrays)
+            const migratedState = {
+              ...persisted.dataState,
+              selectedRowIds: persisted.dataState.selectedRowIds || [],
+              dismissedRecommendationIds: persisted.dataState.dismissedRecommendationIds || [],
+            };
+            
+            setDataState(migratedState);
+            setActiveTab(persisted.activeTab as 'labeling' | 'report' | 'labels');
+            setSyncStatus('synced');
+            
+            // Set isLoaded AFTER data is set to prevent premature redirect
+            setTimeout(() => {
+              setIsLoaded(true);
+            }, 100);
+            // Keep justLoadedRef true longer to prevent redirect
+            setTimeout(() => {
+              justLoadedRef.current = false;
+            }, 1000);
+          } else {
+            setSyncStatus('synced');
+            setIsLoaded(true);
+          }
+        } catch (error) {
+          console.error('Failed to load session:', error);
+          setSyncStatus('error');
+          setIsLoaded(true);
+        }
+      } else {
+        // No session in URL, check if there's an active session (only on first load)
+        if (!isLoaded && stateSyncRef.current) {
+          const activeSession = await stateSyncRef.current.getActiveSessionId();
+          if (activeSession) {
+            // Redirect to the active session
+            router.replace(`/?session=${activeSession}`);
+            return;
+          }
+        } else if (!isLoaded) {
+          // Fallback to old method
+          const activeSession = getActiveSessionId();
+          if (activeSession) {
+            router.replace(`/?session=${activeSession}`);
+            return;
+          }
+        }
+        setIsLoaded(true);
       }
-    } else {
-      // No session in URL, check if there's an active session
-      const activeSession = getActiveSessionId();
-      if (activeSession) {
-        // Redirect to the active session
-        router.replace(`/?session=${activeSession}`);
-        return;
-      }
-    }
+    };
 
-    setIsLoaded(true);
-  }, [searchParams, router]);
+    loadSession();
+    // Use the actual session ID from URL as dependency, not the searchParams object
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlSessionId]);
 
-  // Update URL when session or data changes
+  // Update URL when session or data changes (prevent duplicate navigations)
   useEffect(() => {
-    if (!isLoaded) return;
+    if (!isLoaded || isNavigatingRef.current || justLoadedRef.current || isResettingRef.current) return;
 
-    if (dataState.data && sessionId) {
+    // If we have data and a session ID, ensure URL matches
+    if (dataState.data && sessionId && urlSessionId !== sessionId) {
       // Ensure URL reflects current session
-      const urlSessionId = searchParams.get('session');
-      if (urlSessionId !== sessionId) {
-        router.replace(`/?session=${sessionId}`, { scroll: false });
-      }
-    } else if (!dataState.data && sessionId) {
-      // Data was cleared, but we still have a session ID
-      const urlSessionId = searchParams.get('session');
-      if (urlSessionId === sessionId) {
-        // Clear the URL
-        router.replace('/', { scroll: false });
-      }
+      isNavigatingRef.current = true;
+      router.replace(`/?session=${sessionId}`, { scroll: false });
+      setTimeout(() => { isNavigatingRef.current = false; }, 100);
+    } else if (!dataState.data && !urlSessionId && sessionId) {
+      // Data was cleared but we still have a sessionId in state, clear it
+      setSessionId(null);
     }
-  }, [dataState.data, sessionId, isLoaded, router, searchParams]);
+  }, [dataState.data, sessionId, isLoaded, router, urlSessionId]);
 
-  // Save state to localStorage whenever it changes
-  useEffect(() => {
-    if (isLoaded && sessionId) {
-      saveStateToStorage(sessionId, dataState, activeTab, 'data');
+  // Manual save function using StateSync
+  const saveState = useCallback(async () => {
+    if (sessionId && isLoaded && !justLoadedRef.current) {
+      try {
+        setSyncStatus('syncing');
+        
+        if (!stateSyncRef.current) {
+          // Fallback to old method
+          saveStateToStorage(sessionId, dataState, activeTab, 'data');
+          setSyncStatus('synced');
+          return;
+        }
+
+        const result = await stateSyncRef.current.saveState(sessionId, dataState, activeTab, 'data');
+        
+        if (result.success) {
+          setSyncStatus('synced');
+        } else {
+          console.error('Failed to save state:', result.error);
+          setSyncStatus('offline'); // Likely saved to local but not backend
+        }
+      } catch (error) {
+        console.error('Error saving state:', error);
+        setSyncStatus('error');
+      }
     }
-  }, [dataState, activeTab, isLoaded, sessionId]);
+  }, [sessionId, dataState, activeTab, isLoaded]);
+
+  // Save on specific user actions only (not automatic on every state change)
+  useEffect(() => {
+    if (!isLoaded || !sessionId || justLoadedRef.current || !dataState.data) return;
+
+    // Only save when data exists (after file upload, label changes, etc.)
+    const timeoutId = setTimeout(() => {
+      saveState();
+    }, 500);
+
+    return () => clearTimeout(timeoutId);
+    // Only depend on data-related changes, not the full dataState
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataState.data?.length, dataState.labels.length, dataState.rules.length, isLoaded, sessionId]);
 
   const handleFileUpload = async (file: File) => {
     setDataState(prev => ({ ...prev, isLoading: true }));
@@ -152,12 +321,18 @@ export default function Home() {
         fileName: file.name,
         validationReport: report,
         isLoading: false,
-        selectedRows: new Set<string>(),
+        selectedRowIds: [],
         actionHistory: [],
         currentHistoryIndex: -1,
         recommendations: [],
-        dismissedRecommendations: new Set<string>(),
+        dismissedRecommendationIds: [],
       }));
+
+      // Show success message for new file upload
+      setShowSuccessMessage(true);
+      setTimeout(() => {
+        setShowSuccessMessage(false);
+      }, 5000);
 
       // Navigate to new session URL
       router.push(`/?session=${newSessionId}`);
@@ -168,37 +343,59 @@ export default function Home() {
     }
   };
 
-  const resetData = () => {
-    // Don't clear the session from storage - just reset the UI state
-    // This allows the session list to still show the session
-    // But DO clear the active session marker so we don't auto-redirect
-    if (sessionId) {
-      // Clear just the active session marker, not the session data
-      localStorage.removeItem('data-labeler-active-session');
-      localStorage.removeItem('data-labeler-has-data');
+  const resetData = async () => {
+    // Set resetting flag to prevent redirect effect
+    isResettingRef.current = true;
+    
+    // Clear the active session ID to prevent redirect loop
+    if (stateSyncRef.current) {
+      await stateSyncRef.current.clearActiveSessionId();
+    } else {
+      // Fallback: clear from localStorage directly
+      try {
+        localStorage.removeItem('data-labeler:active-session');
+      } catch (error) {
+        console.error('Failed to clear active session:', error);
+      }
     }
-
+    
+    // Clear session ID
+    setSessionId(null);
+    
+    // Clear the data state
     setDataState(prev => ({
       ...prev,
       data: null,
       fileName: null,
       validationReport: null,
       isLoading: false,
-      selectedRows: new Set<string>(),
+      selectedRowIds: [],
       actionHistory: [],
       currentHistoryIndex: -1,
       isLabelingMode: false,
     }));
     setActiveTab('labeling');
-    setSessionId(null);
+    
+    // Navigate to home
     router.push('/');
+    
+    // Clear the resetting flag after navigation
+    setTimeout(() => { 
+      isResettingRef.current = false;
+    }, 500);
   };
 
-  const clearSessionAndReset = () => {
+  const clearSessionAndReset = async () => {
+    // This function is called when user explicitly wants to delete session data
+    // via the "Clear Saved Data" button
     if (sessionId) {
-      clearStoredState(sessionId); // Actually delete the session from storage
+      if (stateSyncRef.current) {
+        await stateSyncRef.current.deleteSession(sessionId); // Delete from all adapters
+      } else {
+        await clearStoredState(sessionId); // Fallback
+      }
     }
-    resetData();
+    await resetData();
   };
 
   const goToData = () => {
@@ -207,8 +404,24 @@ export default function Home() {
     }
   };
 
-  const handleSelectSession = (selectedSessionId: string) => {
+  const handleSelectSession = async (selectedSessionId: string) => {
+    console.log('handleSelectSession called with:', selectedSessionId);
+    
+    // Set navigating flag to prevent interference
+    isNavigatingRef.current = true;
+    justLoadedRef.current = true;
+    
+    // Navigate to the session
     router.push(`/?session=${selectedSessionId}`);
+    
+    // Clear flags after navigation
+    setTimeout(() => {
+      isNavigatingRef.current = false;
+    }, 200);
+    
+    setTimeout(() => {
+      justLoadedRef.current = false;
+    }, 1000);
   };
 
   // Labeling functions
@@ -226,27 +439,27 @@ export default function Home() {
 
   const handleRowSelect = useCallback((rowId: string, selected: boolean) => {
     setDataState(prev => {
-      const newSelectedRows = new Set(prev.selectedRows);
+      const prevSet = new Set(prev.selectedRowIds);
       if (selected) {
-        newSelectedRows.add(rowId);
+        prevSet.add(rowId);
       } else {
-        newSelectedRows.delete(rowId);
+        prevSet.delete(rowId);
       }
-      return { ...prev, selectedRows: newSelectedRows };
+      return { ...prev, selectedRowIds: Array.from(prevSet) };
     });
   }, []);
 
   const handleBulkSelect = useCallback((rowIds: string[], selected: boolean) => {
     setDataState(prev => {
-      const newSelectedRows = new Set(prev.selectedRows);
+      const prevSet = new Set(prev.selectedRowIds);
       rowIds.forEach(rowId => {
         if (selected) {
-          newSelectedRows.add(rowId);
+          prevSet.add(rowId);
         } else {
-          newSelectedRows.delete(rowId);
+          prevSet.delete(rowId);
         }
       });
-      return { ...prev, selectedRows: newSelectedRows };
+      return { ...prev, selectedRowIds: Array.from(prevSet) };
     });
   }, []);
 
@@ -263,11 +476,11 @@ export default function Home() {
 
     // Store rule suggestion for later use (removed auto-popup)
     if (!skipRuleCreation && rowIds.length === 1) {
-      const labeledTransaction = dataState.data.find(t => t.id === rowIds[0]);
+      const labeledTransaction = dataState.data?.find(t => t.id === rowIds[0]);
       const label = dataState.labels.find(l => l.id === labelId);
 
       if (labeledTransaction && label) {
-        const rulePreview = createRulePreview(labeledTransaction, label, dataState.data);
+        const rulePreview = createRulePreview(labeledTransaction, label, dataState.data!);
 
         // Store rule preview but don't auto-show modal
         if (rulePreview.matchingTransactions.length > 0) {
@@ -275,7 +488,7 @@ export default function Home() {
             ...prev,
             data: prev.data ? applyLabel(prev.data, rowIds, labelId) : null,
             labels: updateLabelUsage(prev.labels, labelId, rowIds.length),
-            selectedRows: new Set<string>(),
+        selectedRowIds: [],
             rulePreview, // Store for potential use
             isRuleModalOpen: false, // Don't auto-open
           }));
@@ -290,7 +503,7 @@ export default function Home() {
       ...prev,
       data: prev.data ? applyLabel(prev.data, rowIds, labelId) : null,
       labels: updateLabelUsage(prev.labels, labelId, rowIds.length),
-      selectedRows: new Set<string>(),
+      selectedRowIds: [],
     }));
 
     addToHistory(action);
@@ -310,7 +523,7 @@ export default function Home() {
     setDataState(prev => ({
       ...prev,
       data: prev.data ? removeLabel(prev.data, rowIds) : null,
-      selectedRows: new Set<string>(),
+      selectedRowIds: [],
     }));
 
     addToHistory(action);
@@ -368,7 +581,7 @@ export default function Home() {
 
       // Reapply all rules that reference this label to find new matches
       if (prev.data && prev.rules.length > 0) {
-        const updatedRules = reapplyRulesForLabel(prev.rules, labelId, prev.data);
+        const updatedRules = reapplyRulesForLabel(prev.rules, labelId, prev.data!);
 
         return {
           ...prev,
@@ -474,8 +687,8 @@ export default function Home() {
     setDataState(prev => ({ ...prev, isGeneratingRecommendations: true }));
 
     try {
-      const labeledData = dataState.data.filter(row => row.label);
-      const unlabeledData = dataState.data.filter(row => !row.label && !dataState.dismissedRecommendations.has(row.id!));
+      const labeledData = dataState.data!.filter(row => row.label);
+      const unlabeledData = dataState.data!.filter(row => !row.label && !dismissedRecSet.has(row.id!));
 
       if (labeledData.length === 0 || unlabeledData.length === 0) {
         setDataState(prev => ({
@@ -498,7 +711,7 @@ export default function Home() {
       console.error('Error generating recommendations:', error);
       setDataState(prev => ({ ...prev, isGeneratingRecommendations: false }));
     }
-  }, [dataState.data, dataState.labels, dataState.dismissedRecommendations]);
+  }, [dataState.data, dataState.labels, dismissedRecSet]);
 
   const handleApplyRecommendation = useCallback((recommendation: Recommendation) => {
     handleLabelRows([recommendation.rowId], recommendation.labelId, true); // Skip rule creation for recommendations
@@ -513,16 +726,12 @@ export default function Home() {
   const handleDismissRecommendation = useCallback((recommendationId: string) => {
     setDataState(prev => {
       const recommendation = prev.recommendations.find((r: Recommendation) => r.id === recommendationId);
-      const newDismissed = new Set(prev.dismissedRecommendations);
-
-      if (recommendation) {
-        newDismissed.add(recommendation.rowId);
-      }
-
+      const prevIds = new Set(prev.dismissedRecommendationIds);
+      if (recommendation) prevIds.add(recommendation.rowId);
       return {
         ...prev,
         recommendations: prev.recommendations.filter((r: Recommendation) => r.id !== recommendationId),
-        dismissedRecommendations: newDismissed,
+        dismissedRecommendationIds: Array.from(prevIds),
       };
     });
   }, []);
@@ -598,20 +807,20 @@ export default function Home() {
   const handleCreateNewRule = useCallback((ruleData: Omit<Rule, 'id' | 'createdAt' | 'updatedAt'>) => {
     if (!dataState.data) return;
 
-    // Create the rule
-    const newRule = createRule(
-      ruleData.name,
-      ruleData.pattern,
-      ruleData.description,
-      ruleData.labelId,
-      ruleData.transactionIds
-    );
+    // Create the rule using the new format
+    const newRule: Rule = {
+      ...ruleData,
+      pattern: ruleData.conditions?.description?.toLowerCase() || ruleData.name.toLowerCase(),
+      id: generateId(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
 
     // Apply the rule to find matching transactions
-    const ruleWithMatches = applyRuleToTransactions(newRule, dataState.data);
+    const ruleWithMatches = applyRuleToTransactions(newRule, dataState.data!);
 
     // If rule has an auto-label, apply it to matching transactions
-    const updatedData = ruleData.labelId ? dataState.data.map(transaction => {
+    const updatedData = ruleData.labelId ? dataState.data!.map(transaction => {
       if (ruleWithMatches.transactionIds.includes(transaction.id!)) {
         return {
           ...transaction,
@@ -641,7 +850,7 @@ export default function Home() {
       if (prev.data) {
         const updatedRule = updatedRules.find(r => r.id === ruleId);
         if (updatedRule && updatedRule.isActive) {
-          const reappliedRule = reapplyRule(updatedRule, prev.data);
+          const reappliedRule = reapplyRule(updatedRule, prev.data!);
           return {
             ...prev,
             rules: updatedRules.map(rule =>
@@ -663,7 +872,7 @@ export default function Home() {
 
     setDataState(prev => ({
       ...prev,
-      rules: reapplyAllRules(prev.rules, prev.data),
+      rules: reapplyAllRules(prev.rules, prev.data!),
     }));
   }, [dataState.data]);
 
@@ -685,7 +894,7 @@ export default function Home() {
       );
 
       // If rule has an auto-label, apply it to the transaction
-      const updatedData = rule.labelId ? prev.data.map(transaction => {
+      const updatedData = rule.labelId ? prev.data!.map(transaction => {
         if (transaction.id === transactionId) {
           return {
             ...transaction,
@@ -716,7 +925,7 @@ export default function Home() {
 
       // If rule has an auto-label, consider removing it from the transaction
       // (Only remove if no other rules are applying the same label)
-      const updatedData = rule.labelId ? prev.data.map(transaction => {
+      const updatedData = rule.labelId ? prev.data!.map(transaction => {
         if (transaction.id === transactionId && transaction.label === rule.labelId) {
           // Check if any other rules still apply this label to this transaction
           const otherRulesWithSameLabel = prev.rules.filter(r =>
@@ -800,7 +1009,7 @@ export default function Home() {
                     {dataState.fileName || 'Uploaded Data'}
                   </span>
                   <span className="mx-2">•</span>
-                  <span>{dataState.data.length} transactions</span>
+                  <span>{dataState.data?.length || 0} transactions</span>
                   {sessionId && hasStoredData(sessionId) && (
                     <>
                       <span className="mx-2">•</span>
@@ -812,6 +1021,14 @@ export default function Home() {
             </div>
 
             <div className="flex items-center space-x-2">
+              {/* Sync Status Indicator */}
+              {sessionId && dataState.data && (
+                <SyncStatusIndicator 
+                  status={syncStatus} 
+                  onRetry={() => saveState()}
+                />
+              )}
+              
               {sessionId && hasStoredData(sessionId) && dataState.data && (
                 <button
                   onClick={() => {
@@ -858,9 +1075,9 @@ export default function Home() {
                   <Tag className="h-5 w-5 text-blue-600" />
                   <div className="text-center">
                     <div className="text-blue-800 dark:text-blue-200">
-                      You have loaded data: <strong>{dataState.fileName || 'Uploaded Data'}</strong> ({dataState.data.length} transactions)
+                      You have loaded data: <strong>{dataState.fileName || 'Uploaded Data'}</strong> ({dataState.data?.length || 0} transactions)
                     </div>
-                    {hasStoredData() && (
+                    {sessionId && hasStoredData(sessionId as string) && (
                       <div className="text-green-700 dark:text-green-300 text-sm mt-1">
                         ✓ Auto-restored from previous session
                       </div>
@@ -923,15 +1140,28 @@ export default function Home() {
         ) : dataState.data ? (
           /* Data Display Section */
           <div className="space-y-6">
-            {/* Success Message */}
-            <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4">
-              <div className="flex items-center space-x-3">
-                <FileSpreadsheet className="h-5 w-5 text-green-600" />
-                <span className="text-green-800 dark:text-green-400 font-medium">
-                  Successfully loaded: {dataState.fileName}
-                </span>
+            {/* Success Message - Auto-hides after 5 seconds */}
+            {showSuccessMessage && (
+              <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-3">
+                    <FileSpreadsheet className="h-5 w-5 text-green-600" />
+                    <span className="text-green-800 dark:text-green-400 font-medium">
+                      Successfully loaded: {dataState.fileName}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setShowSuccessMessage(false)}
+                    className="text-green-600 hover:text-green-800 dark:text-green-400 dark:hover:text-green-200"
+                    aria-label="Dismiss"
+                  >
+                    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Tabs */}
             <div className="border-b border-gray-200 dark:border-gray-700">
@@ -980,7 +1210,7 @@ export default function Home() {
                     data={dataState.data}
                     fileName={dataState.fileName!}
                     labels={dataState.labels}
-                    selectedRows={dataState.selectedRows}
+                    selectedRows={dataState.selectedRowIds || []}
                     onRowSelect={handleRowSelect}
                     onBulkSelect={handleBulkSelect}
                     onLabelRows={handleLabelRows}
@@ -1026,17 +1256,28 @@ export default function Home() {
       {/* Rule Manager Modal */}
       <RuleManager
         isOpen={dataState.isRuleManagerOpen}
-        rules={dataState.rules}
         labels={dataState.labels}
         transactions={dataState.data || []}
+        rules={dataState.rules}
         currentTransaction={dataState.currentTransaction}
         onClose={handleCloseRuleManager}
         onCreateRule={handleCreateNewRule}
         onUpdateRule={handleUpdateRule}
         onDeleteRule={handleDeleteRule}
-        onApplyRuleToTransaction={handleApplyRuleToTransaction}
-        onRemoveTransactionFromRule={handleRemoveTransactionFromRule}
+        onRuleApplied={(ruleId, transactionIds) => {
+          // Apply the rule to the specified transactions
+          handleApplyRuleToTransaction(ruleId, transactionIds[0]);
+        }}
       />
+
+      {/* Sync Notification */}
+      {syncNotification && (
+        <SyncNotification
+          message={syncNotification.message}
+          type={syncNotification.type}
+          onClose={() => setSyncNotification(null)}
+        />
+      )}
     </div>
   );
 }

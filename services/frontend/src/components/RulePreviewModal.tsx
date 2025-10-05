@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { TransactionData, Label, Rule } from '@/types';
 import { RulePreview } from '@/lib/ruleEngine';
 import { X, Check, AlertCircle, Eye, EyeOff, Zap, Target, Code, Info } from 'lucide-react';
@@ -27,50 +27,71 @@ export default function RulePreviewModal({
   onApplyRule,
   onPreviewRule,
 }: RulePreviewModalProps) {
-  const [selectedTransactions, setSelectedTransactions] = useState<Set<string>>(new Set());
+  const [selectedTransactionIds, setSelectedTransactionIds] = useState<string[]>([]);
   const [showRegexDetails, setShowRegexDetails] = useState(false);
 
+  // Memoize Set for O(1) lookups
+  const selectedTransactionsSet = useMemo(
+    () => new Set(selectedTransactionIds),
+    [selectedTransactionIds]
+  );
+
   // Auto-select all matching transactions when modal opens
+  // Use JSON.stringify to create stable dependency for array comparison
+  const matchingTransactionIds = useMemo(
+    () => matchingTransactions.map(t => t.id!).join(','),
+    [matchingTransactions]
+  );
+  
+  const rulePreviewIds = useMemo(
+    () => rulePreview?.matchingTransactions.map(t => t.id!).join(',') || '',
+    [rulePreview]
+  );
+
   useEffect(() => {
     if (rulePreview) {
-      const allIds = new Set(rulePreview.matchingTransactions.map(t => t.id!));
-      setSelectedTransactions(allIds);
+      const allIds = rulePreview.matchingTransactions.map(t => t.id!);
+      setSelectedTransactionIds(allIds);
     } else if (rule && matchingTransactions.length > 0) {
-      const allIds = new Set(matchingTransactions.map(t => t.id!));
-      setSelectedTransactions(allIds);
+      const allIds = matchingTransactions.map(t => t.id!);
+      setSelectedTransactionIds(allIds);
     }
-  }, [rulePreview, rule, matchingTransactions]);
+    // Use stable string IDs instead of array references
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rulePreviewIds, matchingTransactionIds, rule?.id]);
 
   if (!isOpen) return null;
 
   // Handle both old RulePreview format and new enhanced Rule format
   const currentRule = rulePreview?.rule || rule;
   const currentMatchingTransactions = rulePreview?.matchingTransactions || matchingTransactions;
-  const label = currentRule ? getLabelById(labels, currentRule.labelId) : null;
+  const label = currentRule?.labelId ? getLabelById(labels, currentRule.labelId) : null;
 
   if (!currentRule || !label || (!rulePreview && currentMatchingTransactions.length === 0)) return null;
 
   const handleToggleTransaction = (transactionId: string) => {
-    const newSelected = new Set(selectedTransactions);
-    if (newSelected.has(transactionId)) {
-      newSelected.delete(transactionId);
-    } else {
-      newSelected.add(transactionId);
-    }
-    setSelectedTransactions(newSelected);
+    setSelectedTransactionIds(prev => {
+      const newSelected = new Set(prev);
+      if (newSelected.has(transactionId)) {
+        newSelected.delete(transactionId);
+      } else {
+        newSelected.add(transactionId);
+      }
+      return Array.from(newSelected);
+    });
   };
 
   const handleSelectAll = () => {
-    const allIds = new Set(currentMatchingTransactions.map(t => t.id!));
-    setSelectedTransactions(allIds);
+    const allIds = currentMatchingTransactions.map(t => t.id!);
+    setSelectedTransactionIds(allIds);
   };
 
   const handleDeselectAll = () => {
-    setSelectedTransactions(new Set());
+    setSelectedTransactionIds([]);
   };
 
   const handleApply = () => {
-    onApplyRule(Array.from(selectedTransactions));
+    onApplyRule(selectedTransactionIds);
     onClose();
   };
 
@@ -207,18 +228,16 @@ export default function RulePreviewModal({
                 )}
 
                 {/* Legacy Pattern Support */}
-                {rulePreview && rulePreview.rule.patterns && (
+                {rulePreview && rulePreview.rule.pattern && (
                   <div className="border-t pt-2">
-                    <h5 className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">Legacy Patterns:</h5>
+                    <h5 className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">Pattern:</h5>
 
-                    {rulePreview.rule.patterns.merchant && (
-                      <div>
-                        <span className="text-sm font-medium text-blue-800 dark:text-blue-200">Extracted Merchant:</span>
-                        <code className="ml-2 px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded text-xs">
-                          {rulePreview.rule.patterns.merchant}
-                        </code>
-                      </div>
-                    )}
+                    <div>
+                      <span className="text-sm font-medium text-blue-800 dark:text-blue-200">Pattern:</span>
+                      <code className="ml-2 px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded text-xs">
+                        {rulePreview.rule.pattern}
+                      </code>
+                    </div>
 
                     {rulePreview.suggestedRegex.merchant && (
                       <div>
@@ -237,7 +256,7 @@ export default function RulePreviewModal({
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-4">
                 <span className="text-sm text-gray-600 dark:text-gray-400">
-                  {selectedTransactions.size} of {currentMatchingTransactions.length} transactions selected
+                  {selectedTransactionIds.length} of {currentMatchingTransactions.length} transactions selected
                 </span>
                 <div className="flex space-x-2">
                   <button
@@ -268,7 +287,7 @@ export default function RulePreviewModal({
               ) : (
                 <div className="max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-lg">
                   {currentMatchingTransactions.map((transaction) => {
-                    const isSelected = selectedTransactions.has(transaction.id!);
+                    const isSelected = selectedTransactionsSet.has(transaction.id!);
                     const description = String(transaction.Description || transaction.description || '');
                     const amount = Number(transaction.Amount || transaction.amount || 0);
                     const date = String(transaction.Date || transaction.date || '');
@@ -312,7 +331,7 @@ export default function RulePreviewModal({
         {/* Footer */}
         <div className="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between">
           <div className="text-sm text-gray-500 dark:text-gray-400">
-            This will apply the "{label.name}" label to {selectedTransactions.size} transactions
+            This will apply the "{label.name}" label to {selectedTransactionIds.length} transactions
           </div>
           <div className="flex space-x-3">
             <button
@@ -323,11 +342,11 @@ export default function RulePreviewModal({
             </button>
             <button
               onClick={handleApply}
-              disabled={selectedTransactions.size === 0}
+              disabled={selectedTransactionIds.length === 0}
               className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Zap className="h-4 w-4" />
-              <span>Apply Labels ({selectedTransactions.size})</span>
+              <span>Apply Labels ({selectedTransactionIds.length})</span>
             </button>
           </div>
         </div>

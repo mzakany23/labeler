@@ -35,27 +35,39 @@ interface RuleManagerProps {
   isOpen: boolean;
   labels: Label[];
   transactions: TransactionData[];
+  rules?: Rule[]; // Optional rules from parent state
   currentFileId?: string; // File ID for backend API calls
   currentTransaction?: TransactionData; // Transaction that opened the manager
   onClose: () => void;
   onRuleApplied?: (ruleId: string, transactionIds: string[]) => void;
   onPreviewRule?: (rule: Rule) => void;
+  onCreateRule?: (rule: Omit<Rule, 'id' | 'createdAt' | 'updatedAt'>) => void;
+  onUpdateRule?: (ruleId: string, updates: Partial<Rule>) => void;
+  onDeleteRule?: (ruleId: string) => void;
 }
 
 export default function RuleManager({
   isOpen,
   labels,
   transactions,
+  rules: parentRules,
   currentFileId,
   currentTransaction,
   onClose,
   onRuleApplied,
   onPreviewRule,
+  onCreateRule,
+  onUpdateRule,
+  onDeleteRule,
 }: RuleManagerProps) {
   const [isCreating, setIsCreating] = useState(false);
   const [editingRule, setEditingRule] = useState<string | null>(null);
-  const [rules, setRules] = useState<Rule[]>([]);
+  const [backendRules, setBackendRules] = useState<Rule[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [useLocalState, setUseLocalState] = useState(!currentFileId); // Use local state if no file ID
+
+  // Use parent rules if provided, otherwise use backend rules
+  const rules = parentRules || backendRules;
   const [newRule, setNewRule] = useState({
     name: '',
     description: '',
@@ -88,6 +100,7 @@ export default function RuleManager({
   const [editRule, setEditRule] = useState({
     name: '',
     description: '',
+    pattern: '',
     // Advanced conditions
     conditions: {
       description: '',
@@ -114,12 +127,15 @@ export default function RuleManager({
     confidence: 0.5,
   });
 
-  // Load rules from backend
+  // Load rules from backend or local state
   useEffect(() => {
-    if (isOpen && currentFileId) {
-      loadRules();
+    if (isOpen) {
+      if (currentFileId && !useLocalState) {
+        loadRules();
+      }
+      // If using local state, rules will be managed in parent component
     }
-  }, [isOpen, currentFileId]);
+  }, [isOpen, currentFileId, useLocalState]);
 
   // Populate edit form when editingRule changes (always runs to maintain hook consistency)
   useEffect(() => {
@@ -129,6 +145,7 @@ export default function RuleManager({
         setEditRule({
           name: rule.name,
           description: rule.description || '',
+          pattern: rule.pattern || '',
           conditions: {
             description: rule.conditions?.description || '',
             merchant: rule.conditions?.merchant || '',
@@ -157,16 +174,25 @@ export default function RuleManager({
   }, [editingRule, rules]);
 
   const loadRules = async () => {
-    if (!currentFileId) return;
+    // Don't load from backend if using parent rules
+    if (parentRules || !currentFileId) {
+      setUseLocalState(true);
+      return;
+    }
 
     setIsLoading(true);
     try {
       const response = await rulesApi.list(true); // Load only active rules
       if (response.data) {
-        setRules(response.data);
+        setBackendRules(response.data);
+      } else if (response.error) {
+        console.warn('Backend not available, using local state:', response.error);
+        setUseLocalState(true);
       }
     } catch (error) {
       console.error('Failed to load rules:', error);
+      console.warn('Falling back to local state mode');
+      setUseLocalState(true);
     } finally {
       setIsLoading(false);
     }
@@ -175,7 +201,7 @@ export default function RuleManager({
   if (!isOpen) return null;
 
   const handleCreateRule = async () => {
-    if (!currentFileId || !newRule.name.trim()) return;
+    if (!newRule.name.trim()) return;
 
     try {
       // Convert form data to rule format
@@ -206,38 +232,46 @@ export default function RuleManager({
       const ruleData = {
         name: newRule.name.trim(),
         description: newRule.description.trim() || undefined,
+        pattern: newRule.conditions.merchant || newRule.conditions.description || newRule.name.toLowerCase(),
         conditions: ruleConditions,
         regex: ruleRegex,
         labelId: newRule.labelId || undefined,
         priority: newRule.priority,
         isActive: newRule.isActive,
         confidence: newRule.confidence,
+        transactionIds: newRule.transactionIds,
       };
 
-      const response = await rulesApi.create(ruleData);
-      if (response.data) {
-        setRules(prev => [...prev, response.data]);
+      // Use callback if provided (local state mode), otherwise use backend API
+      if (onCreateRule) {
+        onCreateRule(ruleData);
         setIsCreating(false);
-
-        // Reset form
-        setNewRule({
-          name: '',
-          description: '',
-          conditions: {
-            description: '',
-            merchant: '',
-            amount: { min: '', max: '', exact: '' },
-            category: '',
-            dateRange: { start: '', end: '' },
-          },
-          regex: { description: '', merchant: '' },
-          labelId: '',
-          priority: 0,
-          isActive: true,
-          confidence: 0.5,
-          transactionIds: [],
-        });
+      } else if (currentFileId) {
+        const response = await rulesApi.create(ruleData);
+        if (response.data) {
+          setBackendRules(prev => [...prev, response.data]);
+          setIsCreating(false);
+        }
       }
+
+      // Reset form
+      setNewRule({
+        name: '',
+        description: '',
+        conditions: {
+          description: '',
+          merchant: '',
+          amount: { min: '', max: '', exact: '' },
+          category: '',
+          dateRange: { start: '', end: '' },
+        },
+        regex: { description: '', merchant: '' },
+        labelId: '',
+        priority: 0,
+        isActive: true,
+        confidence: 0.5,
+        transactionIds: [],
+      });
     } catch (error) {
       console.error('Failed to create rule:', error);
     }
@@ -245,10 +279,16 @@ export default function RuleManager({
 
   const handleUpdateRule = async (rule: Rule, updates: Partial<Rule>) => {
     try {
-      const response = await rulesApi.update(rule.id, updates);
-      if (response.data) {
-        setRules(prev => prev.map(r => r.id === rule.id ? response.data : r));
+      // Use callback if provided (local state mode), otherwise use backend API
+      if (onUpdateRule) {
+        onUpdateRule(rule.id, updates);
         setEditingRule(null);
+      } else if (currentFileId) {
+        const response = await rulesApi.update(rule.id, updates);
+        if (response.data) {
+          setBackendRules(prev => prev.map(r => r.id === rule.id ? response.data : r));
+          setEditingRule(null);
+        }
       }
     } catch (error) {
       console.error('Failed to update rule:', error);
@@ -257,8 +297,13 @@ export default function RuleManager({
 
   const handleDeleteRule = async (ruleId: string) => {
     try {
-      await rulesApi.delete(ruleId);
-      setRules(prev => prev.filter(r => r.id !== ruleId));
+      // Use callback if provided (local state mode), otherwise use backend API
+      if (onDeleteRule) {
+        onDeleteRule(ruleId);
+      } else if (currentFileId) {
+        await rulesApi.delete(ruleId);
+        setBackendRules(prev => prev.filter(r => r.id !== ruleId));
+      }
     } catch (error) {
       console.error('Failed to delete rule:', error);
     }
@@ -651,7 +696,19 @@ export default function RuleManager({
                       onClick={() => {
                         const rule = rules.find(r => r.id === editingRule);
                         if (rule) {
-                          handleUpdateRule(rule, editRule);
+                          // Convert string amounts to numbers
+                          const updates: Partial<Rule> = {
+                            ...editRule,
+                            conditions: {
+                              ...editRule.conditions,
+                              amount: {
+                                min: editRule.conditions.amount.min ? Number(editRule.conditions.amount.min) : undefined,
+                                max: editRule.conditions.amount.max ? Number(editRule.conditions.amount.max) : undefined,
+                                exact: editRule.conditions.amount.exact ? Number(editRule.conditions.amount.exact) : undefined,
+                              }
+                            }
+                          };
+                          handleUpdateRule(rule, updates);
                         }
                       }}
                       disabled={!editRule.name.trim() || !editRule.pattern.trim()}

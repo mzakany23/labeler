@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { Clock, FileText, Tag, Trash2, FolderOpen } from 'lucide-react';
-import { getAllSessions, deleteSession, SessionMetadata } from '@/lib/statePersistence';
+import { getAllSessions, deleteSession, SessionMetadata } from '@/lib/statePersistenceV2';
 
 interface SessionListProps {
   onSelectSession: (sessionId: string) => void;
@@ -15,15 +15,15 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
     loadSessions();
   }, []);
 
-  const loadSessions = () => {
-    const allSessions = getAllSessions();
+  const loadSessions = async () => {
+    const allSessions = await getAllSessions();
     setSessions(allSessions);
   };
 
-  const handleDeleteSession = (sessionId: string, fileName: string) => {
-    if (confirm(`Delete session "${fileName}"? This cannot be undone.`)) {
-      deleteSession(sessionId);
-      loadSessions();
+  const handleDeleteSession = async (sessionId: string, fileName: string | null) => {
+    if (confirm(`Delete session "${fileName || 'Untitled'}"? This cannot be undone.`)) {
+      await deleteSession(sessionId);
+      await loadSessions();
     }
   };
 
@@ -69,19 +69,19 @@ export default function SessionList({ onSelectSession }: SessionListProps) {
                       <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
                         <span className="flex items-center space-x-1">
                           <FileText className="h-3 w-3" />
-                          <span>{session.dataLength.toLocaleString()} transactions</span>
+                          <span>{session.rowCount.toLocaleString()} transactions</span>
                         </span>
-                        {session.labeledCount !== undefined && (
+                        {session.labelCount > 0 && (
                           <span className="flex items-center space-x-1">
                             <Tag className="h-3 w-3" />
                             <span>
-                              {session.labeledCount} labeled ({Math.round((session.labeledCount / session.dataLength) * 100)}%)
+                              {session.labelCount} labels
                             </span>
                           </span>
                         )}
                         <span className="flex items-center space-x-1">
                           <Clock className="h-3 w-3" />
-                          <span>{session.lastModified}</span>
+                          <span>{session.lastModified.toLocaleString()}</span>
                         </span>
                       </div>
                     </div>

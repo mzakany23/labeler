@@ -9,7 +9,7 @@ interface LabelingDataPreviewProps {
   data: TransactionData[];
   fileName: string;
   labels: Label[];
-  selectedRows: Set<string>;
+  selectedRows: string[]; // Array-based to prevent Set re-render issues
   onRowSelect: (rowId: string, selected: boolean) => void;
   onBulkSelect: (rowIds: string[], selected: boolean) => void;
   onLabelRows: (rowIds: string[], labelId: string) => void;
@@ -32,6 +32,9 @@ export default function LabelingDataPreview({
   const [filterLabel, setFilterLabel] = useState<string>('all');
   const [showLabelDropdown, setShowLabelDropdown] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Convert array to Set for O(1) lookups, memoized to prevent recreating on every render
+  const selectedRowsSet = useMemo(() => new Set(selectedRows), [selectedRows]);
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -99,19 +102,19 @@ export default function LabelingDataPreview({
   };
 
   const handleLabelSelected = (labelId: string) => {
-    if (selectedRows.size > 0) {
-      onLabelRows(Array.from(selectedRows), labelId);
+    if (selectedRows.length > 0) {
+      onLabelRows(selectedRows, labelId);
     }
     setShowLabelDropdown(null);
   };
 
   const handleUnlabelSelected = () => {
-    if (selectedRows.size > 0) {
-      onUnlabelRows(Array.from(selectedRows));
+    if (selectedRows.length > 0) {
+      onUnlabelRows(selectedRows);
     }
   };
 
-  const currentPageSelectedCount = currentData.filter(row => selectedRows.has(row.id!)).length;
+  const currentPageSelectedCount = currentData.filter(row => selectedRowsSet.has(row.id!)).length;
   const allCurrentPageSelected = currentData.length > 0 && currentPageSelectedCount === currentData.length;
 
   return (
@@ -166,10 +169,10 @@ export default function LabelingDataPreview({
         </div>
 
         {/* Bulk Actions */}
-        {selectedRows.size > 0 && (
+        {selectedRows.length > 0 && (
           <div className="flex items-center space-x-2">
             <span className="text-sm text-gray-600 dark:text-gray-400">
-              {selectedRows.size} selected
+              {selectedRows.length} selected
             </span>
 
             <div className="relative">
@@ -243,7 +246,7 @@ export default function LabelingDataPreview({
             <tbody>
               {currentData.map((row, rowIndex) => {
                 const rowLabel = row.label ? getLabelById(labels, row.label) : null;
-                const isSelected = selectedRows.has(row.id!);
+                const isSelected = selectedRowsSet.has(row.id!);
 
                 return (
                   <tr key={row.id || rowIndex} className={`border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800 ${isSelected ? 'bg-blue-50 dark:bg-blue-900/20' : ''}`}>

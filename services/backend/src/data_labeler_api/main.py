@@ -17,6 +17,7 @@ from .api.rules import router as rules_router
 from .api.recommendations import router as recommendations_router
 from .api.merchant_patterns import router as merchant_patterns_router
 from .api.configuration import router as configuration_router
+from .api.sessions import router as sessions_router
 
 # Configure logging
 logging.basicConfig(
@@ -67,6 +68,7 @@ app.include_router(rules_router, prefix="/api/v1")
 app.include_router(recommendations_router, prefix="/api/v1")
 app.include_router(merchant_patterns_router, prefix="/api/v1")
 app.include_router(configuration_router, prefix="/api/v1")
+app.include_router(sessions_router, prefix="/api/v1")
 
 # Configure CORS
 app.add_middleware(
