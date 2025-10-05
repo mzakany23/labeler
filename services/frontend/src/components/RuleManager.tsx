@@ -2,7 +2,8 @@
 
 import { Rule, Label, TransactionData } from '@/types';
 import { useState, useEffect } from 'react';
-import { X, Plus, Edit, Trash2, Check, Tag, Zap } from 'lucide-react';
+import { X, Plus, Edit, Trash2, Check, Tag, Zap, Eye } from 'lucide-react';
+import { rulesApi, recommendationsApi } from '@/lib/apiClient';
 
 // Helper function to safely format dates
 const formatDate = (date: any): string => {
@@ -32,48 +33,93 @@ const formatDate = (date: any): string => {
 
 interface RuleManagerProps {
   isOpen: boolean;
-  rules: Rule[];
   labels: Label[];
   transactions: TransactionData[];
+  currentFileId?: string; // File ID for backend API calls
   currentTransaction?: TransactionData; // Transaction that opened the manager
   onClose: () => void;
-  onCreateRule: (rule: Omit<Rule, 'id' | 'createdAt' | 'updatedAt'>) => void;
-  onUpdateRule: (ruleId: string, updates: Partial<Rule>) => void;
-  onDeleteRule: (ruleId: string) => void;
-  onApplyRuleToTransaction: (ruleId: string, transactionId: string) => void;
-  onRemoveTransactionFromRule: (ruleId: string, transactionId: string) => void;
+  onRuleApplied?: (ruleId: string, transactionIds: string[]) => void;
+  onPreviewRule?: (rule: Rule) => void;
 }
 
 export default function RuleManager({
   isOpen,
-  rules,
   labels,
   transactions,
+  currentFileId,
   currentTransaction,
   onClose,
-  onCreateRule,
-  onUpdateRule,
-  onDeleteRule,
-  onApplyRuleToTransaction,
-  onRemoveTransactionFromRule,
+  onRuleApplied,
+  onPreviewRule,
 }: RuleManagerProps) {
   const [isCreating, setIsCreating] = useState(false);
   const [editingRule, setEditingRule] = useState<string | null>(null);
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
   const [newRule, setNewRule] = useState({
     name: '',
     description: '',
-    pattern: '',
+    // Advanced conditions
+    conditions: {
+      description: '',
+      merchant: '',
+      amount: {
+        min: '',
+        max: '',
+        exact: '',
+      },
+      category: '',
+      dateRange: {
+        start: '',
+        end: '',
+      },
+    },
+    // Regex patterns
+    regex: {
+      description: '',
+      merchant: '',
+    },
     labelId: '',
+    priority: 0,
     isActive: true,
+    confidence: 0.5,
     transactionIds: [] as string[],
   });
   const [editRule, setEditRule] = useState({
     name: '',
     description: '',
-    pattern: '',
+    // Advanced conditions
+    conditions: {
+      description: '',
+      merchant: '',
+      amount: {
+        min: '',
+        max: '',
+        exact: '',
+      },
+      category: '',
+      dateRange: {
+        start: '',
+        end: '',
+      },
+    },
+    // Regex patterns
+    regex: {
+      description: '',
+      merchant: '',
+    },
     labelId: '',
+    priority: 0,
     isActive: true,
+    confidence: 0.5,
   });
+
+  // Load rules from backend
+  useEffect(() => {
+    if (isOpen && currentFileId) {
+      loadRules();
+    }
+  }, [isOpen, currentFileId]);
 
   // Populate edit form when editingRule changes (always runs to maintain hook consistency)
   useEffect(() => {
@@ -83,55 +129,179 @@ export default function RuleManager({
         setEditRule({
           name: rule.name,
           description: rule.description || '',
-          pattern: rule.pattern,
+          conditions: {
+            description: rule.conditions?.description || '',
+            merchant: rule.conditions?.merchant || '',
+            amount: {
+              min: rule.conditions?.amount?.min?.toString() || '',
+              max: rule.conditions?.amount?.max?.toString() || '',
+              exact: rule.conditions?.amount?.exact?.toString() || '',
+            },
+            category: rule.conditions?.category || '',
+            dateRange: {
+              start: rule.conditions?.dateRange?.start || '',
+              end: rule.conditions?.dateRange?.end || '',
+            },
+          },
+          regex: {
+            description: rule.regex?.description || '',
+            merchant: rule.regex?.merchant || '',
+          },
           labelId: rule.labelId || '',
+          priority: rule.priority,
           isActive: rule.isActive,
+          confidence: rule.confidence,
         });
       }
     }
   }, [editingRule, rules]);
 
-  if (!isOpen) return null;
+  const loadRules = async () => {
+    if (!currentFileId) return;
 
-  const handleCreateRule = () => {
-    if (newRule.name.trim() && newRule.pattern.trim()) {
-      onCreateRule({
-        ...newRule,
-        name: newRule.name.trim(),
-        pattern: newRule.pattern.trim(),
-        description: newRule.description.trim() || undefined,
-        labelId: newRule.labelId || undefined,
-        transactionIds: currentTransaction ? [currentTransaction.id!] : [],
-      });
-
-      setNewRule({
-        name: '',
-        description: '',
-        pattern: '',
-        labelId: '',
-        isActive: true,
-        transactionIds: [],
-      });
-      setIsCreating(false);
+    setIsLoading(true);
+    try {
+      const response = await rulesApi.list(true); // Load only active rules
+      if (response.data) {
+        setRules(response.data);
+      }
+    } catch (error) {
+      console.error('Failed to load rules:', error);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const handleUpdateRule = (rule: Rule, updates: Partial<Rule>) => {
-    onUpdateRule(rule.id, updates);
-    setEditingRule(null);
+  if (!isOpen) return null;
+
+  const handleCreateRule = async () => {
+    if (!currentFileId || !newRule.name.trim()) return;
+
+    try {
+      // Convert form data to rule format
+      const ruleConditions = {
+        ...(newRule.conditions.description && { description: newRule.conditions.description }),
+        ...(newRule.conditions.merchant && { merchant: newRule.conditions.merchant }),
+        ...(newRule.conditions.category && { category: newRule.conditions.category }),
+        ...((newRule.conditions.amount.min || newRule.conditions.amount.max || newRule.conditions.amount.exact) && {
+          amount: {
+            ...(newRule.conditions.amount.min && { min: Number(newRule.conditions.amount.min) }),
+            ...(newRule.conditions.amount.max && { max: Number(newRule.conditions.amount.max) }),
+            ...(newRule.conditions.amount.exact && { exact: Number(newRule.conditions.amount.exact) }),
+          }
+        }),
+        ...((newRule.conditions.dateRange.start || newRule.conditions.dateRange.end) && {
+          dateRange: {
+            ...(newRule.conditions.dateRange.start && { start: newRule.conditions.dateRange.start }),
+            ...(newRule.conditions.dateRange.end && { end: newRule.conditions.dateRange.end }),
+          }
+        }),
+      };
+
+      const ruleRegex = {
+        ...(newRule.regex.description && { description: newRule.regex.description }),
+        ...(newRule.regex.merchant && { merchant: newRule.regex.merchant }),
+      };
+
+      const ruleData = {
+        name: newRule.name.trim(),
+        description: newRule.description.trim() || undefined,
+        conditions: ruleConditions,
+        regex: ruleRegex,
+        labelId: newRule.labelId || undefined,
+        priority: newRule.priority,
+        isActive: newRule.isActive,
+        confidence: newRule.confidence,
+      };
+
+      const response = await rulesApi.create(ruleData);
+      if (response.data) {
+        setRules(prev => [...prev, response.data]);
+        setIsCreating(false);
+
+        // Reset form
+        setNewRule({
+          name: '',
+          description: '',
+          conditions: {
+            description: '',
+            merchant: '',
+            amount: { min: '', max: '', exact: '' },
+            category: '',
+            dateRange: { start: '', end: '' },
+          },
+          regex: { description: '', merchant: '' },
+          labelId: '',
+          priority: 0,
+          isActive: true,
+          confidence: 0.5,
+          transactionIds: [],
+        });
+      }
+    } catch (error) {
+      console.error('Failed to create rule:', error);
+    }
+  };
+
+  const handleUpdateRule = async (rule: Rule, updates: Partial<Rule>) => {
+    try {
+      const response = await rulesApi.update(rule.id, updates);
+      if (response.data) {
+        setRules(prev => prev.map(r => r.id === rule.id ? response.data : r));
+        setEditingRule(null);
+      }
+    } catch (error) {
+      console.error('Failed to update rule:', error);
+    }
+  };
+
+  const handleDeleteRule = async (ruleId: string) => {
+    try {
+      await rulesApi.delete(ruleId);
+      setRules(prev => prev.filter(r => r.id !== ruleId));
+    } catch (error) {
+      console.error('Failed to delete rule:', error);
+    }
+  };
+
+  const handlePreviewRule = async (rule: Rule) => {
+    if (!currentFileId || !onPreviewRule) return;
+
+    try {
+      const response = await rulesApi.preview(rule.id, currentFileId);
+      if (response.data) {
+        onPreviewRule(rule);
+      }
+    } catch (error) {
+      console.error('Failed to preview rule:', error);
+    }
   };
 
   const isTransactionInRule = (rule: Rule) => {
     return currentTransaction ? rule.transactionIds.includes(currentTransaction.id!) : false;
   };
 
-  const toggleTransactionInRule = (rule: Rule) => {
-    if (!currentTransaction) return;
+  const toggleTransactionInRule = async (rule: Rule) => {
+    if (!currentTransaction || !currentFileId) return;
 
-    if (isTransactionInRule(rule)) {
-      onRemoveTransactionFromRule(rule.id, currentTransaction.id!);
-    } else {
-      onApplyRuleToTransaction(rule.id, currentTransaction.id!);
+    try {
+      if (isTransactionInRule(rule)) {
+        // Remove transaction from rule (not directly supported by API, so we'll need to reapply without this transaction)
+        await rulesApi.apply(rule.id, currentFileId, []);
+      } else {
+        // Apply rule to specific transaction
+        await rulesApi.apply(rule.id, currentFileId, [currentTransaction.id!]);
+      }
+
+      // Refresh rules to get updated state
+      await loadRules();
+
+      // Notify parent component
+      if (onRuleApplied) {
+        onRuleApplied(rule.id, [currentTransaction.id!]);
+      }
+    } catch (error) {
+      console.error('Failed to toggle transaction in rule:', error);
     }
   };
 
@@ -174,31 +344,35 @@ export default function RuleManager({
             {isCreating && (
               <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4 mb-4">
                 <h4 className="text-md font-medium text-blue-900 dark:text-blue-100 mb-3">Create New Rule</h4>
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
-                      Rule Name *
-                    </label>
-                    <input
-                      type="text"
-                      value={newRule.name}
-                      onChange={(e) => setNewRule({ ...newRule, name: e.target.value })}
-                      placeholder="e.g., Starbucks Transactions"
-                      className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
-                    />
+                <div className="space-y-4">
+                  {/* Basic Info */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                        Rule Name *
+                      </label>
+                      <input
+                        type="text"
+                        value={newRule.name}
+                        onChange={(e) => setNewRule({ ...newRule, name: e.target.value })}
+                        placeholder="e.g., Starbucks Transactions"
+                        className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                        Priority
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={newRule.priority}
+                        onChange={(e) => setNewRule({ ...newRule, priority: parseInt(e.target.value) || 0 })}
+                        className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
-                      Pattern *
-                    </label>
-                    <input
-                      type="text"
-                      value={newRule.pattern}
-                      onChange={(e) => setNewRule({ ...newRule, pattern: e.target.value })}
-                      placeholder="e.g., starbucks, amazon, grocery"
-                      className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
-                    />
-                  </div>
+
                   <div>
                     <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
                       Description
@@ -211,7 +385,127 @@ export default function RuleManager({
                       className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
                     />
                   </div>
-                  <div>
+
+                  {/* Merchant Condition */}
+                  <div className="border-t pt-3">
+                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">
+                      Merchant Pattern
+                    </label>
+                    <input
+                      type="text"
+                      value={newRule.conditions.merchant}
+                      onChange={(e) => setNewRule({
+                        ...newRule,
+                        conditions: { ...newRule.conditions, merchant: e.target.value }
+                      })}
+                      placeholder="e.g., STARBUCKS, AMAZON"
+                      className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                    />
+                  </div>
+
+                  {/* Amount Conditions */}
+                  <div className="border-t pt-3">
+                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">
+                      Amount Conditions
+                    </label>
+                    <div className="grid grid-cols-3 gap-2">
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={newRule.conditions.amount.exact}
+                        onChange={(e) => setNewRule({
+                          ...newRule,
+                          conditions: {
+                            ...newRule.conditions,
+                            amount: { ...newRule.conditions.amount, exact: e.target.value }
+                          }
+                        })}
+                        placeholder="Exact amount"
+                        className="px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={newRule.conditions.amount.min}
+                        onChange={(e) => setNewRule({
+                          ...newRule,
+                          conditions: {
+                            ...newRule.conditions,
+                            amount: { ...newRule.conditions.amount, min: e.target.value }
+                          }
+                        })}
+                        placeholder="Min amount"
+                        className="px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={newRule.conditions.amount.max}
+                        onChange={(e) => setNewRule({
+                          ...newRule,
+                          conditions: {
+                            ...newRule.conditions,
+                            amount: { ...newRule.conditions.amount, max: e.target.value }
+                          }
+                        })}
+                        placeholder="Max amount"
+                        className="px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Category Condition */}
+                  <div className="border-t pt-3">
+                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                      Category Pattern
+                    </label>
+                    <input
+                      type="text"
+                      value={newRule.conditions.category}
+                      onChange={(e) => setNewRule({
+                        ...newRule,
+                        conditions: { ...newRule.conditions, category: e.target.value }
+                      })}
+                      placeholder="e.g., food, transportation, entertainment"
+                      className="w-full px-3 py-2 border border-blue-300 dark:border-blue-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                    />
+                  </div>
+
+                  {/* Date Range */}
+                  <div className="border-t pt-3">
+                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">
+                      Date Range (Optional)
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="date"
+                        value={newRule.conditions.dateRange.start}
+                        onChange={(e) => setNewRule({
+                          ...newRule,
+                          conditions: {
+                            ...newRule.conditions,
+                            dateRange: { ...newRule.conditions.dateRange, start: e.target.value }
+                          }
+                        })}
+                        className="px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                      <input
+                        type="date"
+                        value={newRule.conditions.dateRange.end}
+                        onChange={(e) => setNewRule({
+                          ...newRule,
+                          conditions: {
+                            ...newRule.conditions,
+                            dateRange: { ...newRule.conditions.dateRange, end: e.target.value }
+                          }
+                        })}
+                        className="px-2 py-1 text-sm border border-blue-300 dark:border-blue-600 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 dark:bg-gray-800 dark:text-gray-100"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Label Selection */}
+                  <div className="border-t pt-3">
                     <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
                       Auto-apply Label
                     </label>
@@ -226,14 +520,31 @@ export default function RuleManager({
                       ))}
                     </select>
                   </div>
-                  <div className="flex space-x-3">
+
+                  {/* Confidence */}
+                  <div className="border-t pt-3">
+                    <label className="block text-sm font-medium text-blue-800 dark:text-blue-200 mb-1">
+                      Confidence Score: {newRule.confidence.toFixed(2)}
+                    </label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={newRule.confidence}
+                      onChange={(e) => setNewRule({ ...newRule, confidence: parseFloat(e.target.value) })}
+                      className="w-full"
+                    />
+                  </div>
+
+                  <div className="flex space-x-3 pt-3">
                     <button
                       onClick={handleCreateRule}
-                      disabled={!newRule.name.trim() || !newRule.pattern.trim()}
+                      disabled={!newRule.name.trim() || isLoading}
                       className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Check className="h-4 w-4" />
-                      <span>Create</span>
+                      <span>{isLoading ? 'Creating...' : 'Create'}</span>
                     </button>
                     <button
                       onClick={() => {
@@ -241,9 +552,18 @@ export default function RuleManager({
                         setNewRule({
                           name: '',
                           description: '',
-                          pattern: '',
+                          conditions: {
+                            description: '',
+                            merchant: '',
+                            amount: { min: '', max: '', exact: '' },
+                            category: '',
+                            dateRange: { start: '', end: '' },
+                          },
+                          regex: { description: '', merchant: '' },
                           labelId: '',
+                          priority: 0,
                           isActive: true,
+                          confidence: 0.5,
                           transactionIds: [],
                         });
                       }}
@@ -352,9 +672,17 @@ export default function RuleManager({
             )}
           </div>
 
+          {/* Loading State */}
+          {isLoading && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-3"></div>
+              <p>Loading rules...</p>
+            </div>
+          )}
+
           {/* Existing Rules */}
           <div className="space-y-3">
-            {rules.filter(rule => rule.id !== editingRule).length === 0 ? (
+            {!isLoading && rules.filter(rule => rule.id !== editingRule).length === 0 ? (
               <div className="text-center py-8 text-gray-500 dark:text-gray-400">
                 <Zap className="h-12 w-12 mx-auto mb-3 opacity-50" />
                 <p>No rules created yet</p>
@@ -417,6 +745,15 @@ export default function RuleManager({
                             {inRule ? 'Remove' : 'Apply'}
                           </button>
                         )}
+                        {onPreviewRule && (
+                          <button
+                            onClick={() => handlePreviewRule(rule)}
+                            className="p-1 text-gray-400 hover:text-green-600 dark:hover:text-green-400"
+                            title="Preview rule matches"
+                          >
+                            <Eye className="h-4 w-4" />
+                          </button>
+                        )}
                         <button
                           onClick={() => setEditingRule(rule.id)}
                           className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400"
@@ -425,7 +762,7 @@ export default function RuleManager({
                           <Edit className="h-4 w-4" />
                         </button>
                         <button
-                          onClick={() => onDeleteRule(rule.id)}
+                          onClick={() => handleDeleteRule(rule.id)}
                           className="p-1 text-gray-400 hover:text-red-600 dark:hover:text-red-400"
                           title="Delete rule"
                         >

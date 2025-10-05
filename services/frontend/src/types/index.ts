@@ -48,11 +48,35 @@ export interface Rule {
   id: string;
   name: string;
   description?: string;
-  pattern: string; // Text-based pattern for now
+  // Advanced rule conditions
+  conditions: {
+    description?: string;
+    merchant?: string;
+    amount?: {
+      min?: number;
+      max?: number;
+      exact?: number;
+    };
+    category?: string;
+    dateRange?: {
+      start?: string; // ISO date string
+      end?: string;   // ISO date string
+    };
+  };
+  // Regex patterns for advanced matching
+  regex: {
+    description?: string;
+    merchant?: string;
+  };
+  // Rule metadata
   labelId?: string; // Optional label to apply
+  priority: number; // Higher numbers = higher priority (default: 0)
   isActive: boolean;
+  confidence: number; // Confidence score for rule matches (0-1)
   createdAt: Date;
   updatedAt: Date;
+  createdFrom?: string; // ID of transaction that created this rule
+  matchCount: number; // Number of transactions this rule has matched
   transactionIds: string[]; // Transactions assigned to this rule
 }
 
